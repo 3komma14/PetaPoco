@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using PetaTest;
 
@@ -69,14 +71,62 @@ namespace PetaPoco.Tests
 	[TestFixture]
 	public class ColumnMapper 
 	{
+        private class DbHandler : Database.ISpecificDatabaseHandler
+        {
+            public Action<IDbCommand> PreExecute
+            {
+                get { throw new NotImplementedException(); }
+                set { throw new NotImplementedException(); }
+            }
 
+            public Action<IDbCommand> PostExecute
+            {
+                get { throw new NotImplementedException(); }
+                set { throw new NotImplementedException(); }
+            }
 
-		[Test]
+            public string EscapeSqlIdentifier(string sql)
+            {
+                return sql;
+            }
+
+            public string ParamPrefix
+            {
+                get { return "@"; }
+            }
+
+            public MethodInfo GetGetMethod(Type srcType)
+            {
+                throw new NotImplementedException();
+            }
+
+            public IDbCommand CreateCommand(IDbConnection connection, string sql, IDbTransaction transaction, params object[] args)
+            {
+                throw new NotImplementedException();
+            }
+
+            public void AddParam(IDbCommand cmd, object item, string ParameterPrefix)
+            {
+                throw new NotImplementedException();
+            }
+
+            public object InsertAutoincrement(IDbCommand cmd, string primaryKeyName, IDbTransaction transaction)
+            {
+                throw new NotImplementedException();
+            }
+
+            public object InsertAutoincrement(IDbCommand cmd, string primaryKeyName, Action<IDbCommand> preExecute, Action<IDbCommand> executedCommand)
+            {
+                throw new NotImplementedException();
+            }
+        }
+
+	    [Test]
 		public void NoColumnMapper()
 		{
 
 			PetaPoco.Database.Mapper = new MyColumnMapper();
-			var pd=PetaPoco.Database.PocoData.ForType(typeof(Poco2));
+			var pd=PetaPoco.Database.PocoData.ForType(typeof(Poco2), new DbHandler());
 
 			Assert.AreEqual(pd.Columns.Count, 3);
 			Assert.AreEqual(pd.Columns["prop1"].PropertyInfo.Name, "prop1");

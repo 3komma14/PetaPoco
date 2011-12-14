@@ -180,7 +180,7 @@ namespace PetaPoco
             CommonConstruct();
         }
 
-        enum DBType
+        public enum DBType
         {
             SqlServer,
             SqlServerCE,
@@ -191,12 +191,276 @@ namespace PetaPoco
         }
         DBType _dbType = DBType.SqlServer;
 
+        ISpecificDatabaseHandler _dbHandler;
+
+        public interface ISpecificDatabaseHandler
+        {
+            Action<IDbCommand> PreExecute { get; set; }
+            Action<IDbCommand> PostExecute { get; set; }
+
+            string EscapeSqlIdentifier(string sql);
+            string ParamPrefix { get; }
+            MethodInfo GetGetMethod(Type srcType);
+            IDbCommand CreateCommand(IDbConnection connection, string sql, IDbTransaction transaction, params object[] args);
+            void AddParam(IDbCommand cmd, object item, string ParameterPrefix);
+            object InsertAutoincrement(IDbCommand cmd, string primaryKeyName, IDbTransaction transaction);
+        }
+
+        public class CommonDatabaseHandler : ISpecificDatabaseHandler
+        {
+            private readonly DBType _dbType;
+            private bool EnableNamedParams { get; set; }
+
+            public CommonDatabaseHandler(DBType dbType, string connectionString, Action<IDbCommand> preExecute, Action<IDbCommand> postExecute)
+            {
+                _dbType = dbType;
+
+                if (_dbType == DBType.MySql && connectionString != null && connectionString.IndexOf("Allow User Variables=true") >= 0)
+                    ParamPrefix = "?";
+                else if (_dbType == DBType.Oracle)
+                    ParamPrefix = ":";
+                else
+                    ParamPrefix = "@";
+
+                EnableNamedParams = true;
+                PreExecute = preExecute;
+                PostExecute = postExecute;
+            }
+
+            public Action<IDbCommand> PreExecute { get; set; }
+            public Action<IDbCommand> PostExecute { get; set; }
+
+            public string EscapeSqlIdentifier(string str)
+            {
+                switch (_dbType)
+                {
+                    case DBType.MySql:
+                        return string.Format("`{0}`", str);
+
+                    case DBType.PostgreSQL:
+                    case DBType.Oracle:
+                        return string.Format("\"{0}\"", str);
+
+                    default:
+                        return string.Format("[{0}]", str);
+                }
+            }
+
+            public string ParamPrefix { get; private set; }
+
+            public MethodInfo GetGetMethod(Type srcType)
+            {
+                return typeof(IDataRecord).GetMethod("Get" + srcType.Name, new Type[] { typeof(int) });
+            }
+
+            // Create a command
+            static Regex rxParamsPrefix = new Regex(@"(?<!@)@\w+", RegexOptions.Compiled);
+            public IDbCommand CreateCommand(IDbConnection connection, string sql, IDbTransaction transaction, params object[] args)
+            {
+                // Perform named argument replacements
+                if (EnableNamedParams)
+                {
+                    var new_args = new List<object>();
+                    sql = ProcessParams(sql, args, new_args);
+                    args = new_args.ToArray();
+                }
+
+                // Perform parameter prefix replacements
+                if (ParamPrefix != "@")
+                    sql = rxParamsPrefix.Replace(sql, m => ParamPrefix + m.Value.Substring(1));
+                sql = sql.Replace("@@", "@");		   // <- double @@ escapes a single @
+
+                // Create the command and add parameters
+                IDbCommand cmd = connection.CreateCommand();
+                cmd.Connection = connection;
+                cmd.CommandText = sql;
+                cmd.Transaction = transaction;
+                foreach (var item in args)
+                {
+                    AddParam(cmd, item, ParamPrefix);
+                }
+
+                if (_dbType == DBType.Oracle)
+                {
+                    cmd.GetType().GetProperty("BindByName").SetValue(cmd, true, null);
+                }
+
+                if (!String.IsNullOrEmpty(sql))
+                    PreExecute(cmd);
+
+                return cmd;
+            }
+
+            // Add a parameter to a DB command
+            public void AddParam(IDbCommand cmd, object item, string ParameterPrefix)
+            {
+                // Convert value to from poco type to db type
+                if (Database.Mapper != null && item != null)
+                {
+                    var fn = Database.Mapper.GetToDbConverter(item.GetType());
+                    if (fn != null)
+                        item = fn(item);
+                }
+
+                // Support passed in parameters
+                var idbParam = item as IDbDataParameter;
+                if (idbParam != null)
+                {
+                    idbParam.ParameterName = string.Format("{0}{1}", ParameterPrefix, cmd.Parameters.Count);
+                    cmd.Parameters.Add(idbParam);
+                    return;
+                }
+
+                var p = cmd.CreateParameter();
+                p.ParameterName = string.Format("{0}{1}", ParameterPrefix, cmd.Parameters.Count);
+                if (item == null)
+                {
+                    p.Value = DBNull.Value;
+                }
+                else
+                {
+                    var t = item.GetType();
+                    if (t.IsEnum)		// PostgreSQL .NET driver wont cast enum to int
+                    {
+                        p.Value = (int)item;
+                    }
+                    else if (t == typeof(Guid))
+                    {
+                        p.Value = item.ToString();
+                        p.DbType = DbType.String;
+                        p.Size = 40;
+                    }
+                    else if (t == typeof(string))
+                    {
+                        p.Size = Math.Max((item as string).Length + 1, 4000);		// Help query plan caching by using common size
+                        p.Value = item;
+                    }
+                    else if (t == typeof(AnsiString))
+                    {
+                        // Thanks @DataChomp for pointing out the SQL Server indexing performance hit of using wrong string type on varchar
+                        p.Size = Math.Max((item as AnsiString).Value.Length + 1, 4000);
+                        p.Value = (item as AnsiString).Value;
+                        p.DbType = DbType.AnsiString;
+                    }
+                    else if (t == typeof(bool) && _dbType != DBType.PostgreSQL)
+                    {
+                        p.Value = ((bool)item) ? 1 : 0;
+                    }
+                    else if (item.GetType().Name == "SqlGeography") //SqlGeography is a CLR Type
+                    {
+                        p.GetType().GetProperty("UdtTypeName").SetValue(p, "geography", null); //geography is the equivalent SQL Server Type
+                        p.Value = item;
+                    }
+
+                    else if (item.GetType().Name == "SqlGeometry") //SqlGeometry is a CLR Type
+                    {
+                        p.GetType().GetProperty("UdtTypeName").SetValue(p, "geometry", null); //geography is the equivalent SQL Server Type
+                        p.Value = item;
+                    }
+                    else
+                    {
+                        p.Value = item;
+                    }
+                }
+
+                cmd.Parameters.Add(p);
+            }
+
+
+            public object InsertAutoincrement(IDbCommand cmd, string primaryKeyName, IDbTransaction transaction)
+            {
+                object id;
+                switch (_dbType)
+                {
+                    case DBType.SqlServerCE:
+                        PreExecute(cmd);
+                        cmd.ExecuteNonQuery();
+                        PostExecute(cmd);
+
+                        var cmdId = CreateCommand(cmd.Connection, "SELECT @@@IDENTITY AS NewID;", transaction, null);
+                        id = cmdId.ExecuteScalar();
+                        PostExecute(cmdId);
+
+                        break;
+                    case DBType.SqlServer:
+                        cmd.CommandText += ";\nSELECT SCOPE_IDENTITY() AS NewID;";
+                        PreExecute(cmd);
+                        id = cmd.ExecuteScalar();
+                        PostExecute(cmd);
+                        break;
+                    case DBType.PostgreSQL:
+                        if (primaryKeyName != null)
+                        {
+                            cmd.CommandText += string.Format("returning {0} as NewID", EscapeSqlIdentifier(primaryKeyName));
+                            PreExecute(cmd);
+                            id = cmd.ExecuteScalar();
+                        }
+                        else
+                        {
+                            id = -1;
+                            PreExecute(cmd);
+                            cmd.ExecuteNonQuery();
+                        }
+                        PostExecute(cmd);
+                        break;
+                    case DBType.Oracle:
+                        if (primaryKeyName != null)
+                        {
+                            cmd.CommandText += string.Format(" returning {0} into :newid", EscapeSqlIdentifier(primaryKeyName));
+                            var param = cmd.CreateParameter();
+                            param.ParameterName = ":newid";
+                            param.Value = DBNull.Value;
+                            param.Direction = ParameterDirection.ReturnValue;
+                            param.DbType = DbType.Int64;
+                            cmd.Parameters.Add(param);
+                            PreExecute(cmd);
+                            cmd.ExecuteNonQuery();
+                            id = param.Value;
+                        }
+                        else
+                        {
+                            id = -1;
+                            PreExecute(cmd);
+                            cmd.ExecuteNonQuery();
+                        }
+                        PostExecute(cmd);
+                        break;
+                    case DBType.SQLite:
+                        if (primaryKeyName != null)
+                        {
+                            cmd.CommandText += ";\nSELECT last_insert_rowid();";
+                            PreExecute(cmd);
+                            id = cmd.ExecuteScalar();
+                        }
+                        else
+                        {
+                            id = -1;
+                            PreExecute(cmd);
+                            cmd.ExecuteNonQuery();
+                        }
+                        PostExecute(cmd);
+                        break;
+                    default:
+                        cmd.CommandText += ";\nSELECT @@IDENTITY AS NewID;";
+                        PreExecute(cmd);
+                        id = cmd.ExecuteScalar();
+                        PostExecute(cmd);
+                        break;
+                }
+                return id;
+            }
+        }
+
+        public string EscapeSqlIdentifier(string sql)
+        {
+            return _dbHandler.EscapeSqlIdentifier(sql);
+        }
+
         // Common initialization
         private void CommonConstruct()
         {
             _transactionDepth = 0;
             EnableAutoSelect = true;
-            EnableNamedParams = true;
             ForceDateTimesToUtc = true;
 
             if (_providerName != null)
@@ -209,10 +473,7 @@ namespace PetaPoco
             else if (dbtype.StartsWith("Oracle")) _dbType = DBType.Oracle;
             else if (dbtype.StartsWith("SQLite")) _dbType = DBType.SQLite;
 
-            if (_dbType == DBType.MySql && _connectionString != null && _connectionString.IndexOf("Allow User Variables=true") >= 0)
-                _paramPrefix = "?";
-            if (_dbType == DBType.Oracle)
-                _paramPrefix = ":";
+            _dbHandler = new CommonDatabaseHandler(_dbType, _connectionString, DoPreExecute, OnExecutedCommand);
         }
 
         // Automatically close one open shared connection
@@ -382,118 +643,8 @@ namespace PetaPoco
             );
         }
 
-        // Add a parameter to a DB command
-        void AddParam(IDbCommand cmd, object item, string ParameterPrefix)
-        {
-            // Convert value to from poco type to db type
-            if (Database.Mapper != null && item != null)
-            {
-                var fn = Database.Mapper.GetToDbConverter(item.GetType());
-                if (fn != null)
-                    item = fn(item);
-            }
 
-            // Support passed in parameters
-            var idbParam = item as IDbDataParameter;
-            if (idbParam != null)
-            {
-                idbParam.ParameterName = string.Format("{0}{1}", ParameterPrefix, cmd.Parameters.Count);
-                cmd.Parameters.Add(idbParam);
-                return;
-            }
-
-            var p = cmd.CreateParameter();
-            p.ParameterName = string.Format("{0}{1}", ParameterPrefix, cmd.Parameters.Count);
-            if (item == null)
-            {
-                p.Value = DBNull.Value;
-            }
-            else
-            {
-                var t = item.GetType();
-                if (t.IsEnum)		// PostgreSQL .NET driver wont cast enum to int
-                {
-                    p.Value = (int)item;
-                }
-                else if (t == typeof(Guid))
-                {
-                    p.Value = item.ToString();
-                    p.DbType = DbType.String;
-                    p.Size = 40;
-                }
-                else if (t == typeof(string))
-                {
-                    p.Size = Math.Max((item as string).Length + 1, 4000);		// Help query plan caching by using common size
-                    p.Value = item;
-                }
-                else if (t == typeof(AnsiString))
-                {
-                    // Thanks @DataChomp for pointing out the SQL Server indexing performance hit of using wrong string type on varchar
-                    p.Size = Math.Max((item as AnsiString).Value.Length + 1, 4000);
-                    p.Value = (item as AnsiString).Value;
-                    p.DbType = DbType.AnsiString;
-                }
-                else if (t == typeof(bool) && _dbType != DBType.PostgreSQL)
-                {
-                    p.Value = ((bool)item) ? 1 : 0;
-                }
-                else if (item.GetType().Name == "SqlGeography") //SqlGeography is a CLR Type
-                {
-                    p.GetType().GetProperty("UdtTypeName").SetValue(p, "geography", null); //geography is the equivalent SQL Server Type
-                    p.Value = item;
-                }
-
-                else if (item.GetType().Name == "SqlGeometry") //SqlGeometry is a CLR Type
-                {
-                    p.GetType().GetProperty("UdtTypeName").SetValue(p, "geometry", null); //geography is the equivalent SQL Server Type
-                    p.Value = item;
-                }
-                else
-                {
-                    p.Value = item;
-                }
-            }
-
-            cmd.Parameters.Add(p);
-        }
-
-        // Create a command
-        static Regex rxParamsPrefix = new Regex(@"(?<!@)@\w+", RegexOptions.Compiled);
-        public IDbCommand CreateCommand(IDbConnection connection, string sql, params object[] args)
-        {
-            // Perform named argument replacements
-            if (EnableNamedParams)
-            {
-                var new_args = new List<object>();
-                sql = ProcessParams(sql, args, new_args);
-                args = new_args.ToArray();
-            }
-
-            // Perform parameter prefix replacements
-            if (_paramPrefix != "@")
-                sql = rxParamsPrefix.Replace(sql, m => _paramPrefix + m.Value.Substring(1));
-            sql = sql.Replace("@@", "@");		   // <- double @@ escapes a single @
-
-            // Create the command and add parameters
-            IDbCommand cmd = connection.CreateCommand();
-            cmd.Connection = connection;
-            cmd.CommandText = sql;
-            cmd.Transaction = _transaction;
-            foreach (var item in args)
-            {
-                AddParam(cmd, item, _paramPrefix);
-            }
-
-            if (_dbType == DBType.Oracle)
-            {
-                cmd.GetType().GetProperty("BindByName").SetValue(cmd, true, null);
-            }
-
-            if (!String.IsNullOrEmpty(sql))
-                DoPreExecute(cmd);
-
-            return cmd;
-        }
+ 
 
         // Override this to log/capture exceptions
         public virtual void OnException(Exception x)
@@ -516,7 +667,7 @@ namespace PetaPoco
                 OpenSharedConnection();
                 try
                 {
-                    using (var cmd = CreateCommand(_sharedConnection, sql, args))
+                    using (var cmd = _dbHandler.CreateCommand(_sharedConnection, sql, _transaction, args))
                     {
                         var retv = cmd.ExecuteNonQuery();
                         OnExecutedCommand(cmd);
@@ -548,7 +699,7 @@ namespace PetaPoco
                 OpenSharedConnection();
                 try
                 {
-                    using (var cmd = CreateCommand(_sharedConnection, sql, args))
+                    using (var cmd = _dbHandler.CreateCommand(_sharedConnection, sql, _transaction, args))
                     {
                         object val = cmd.ExecuteScalar();
                         OnExecutedCommand(cmd);
@@ -581,9 +732,9 @@ namespace PetaPoco
 
             if (!rxSelect.IsMatch(sql))
             {
-                var pd = PocoData.ForType(typeof(T));
+                var pd = PocoData.ForType(typeof(T), _dbHandler);
                 var tableName = EscapeTableName(pd.TableInfo.TableName);
-                string cols = string.Join(", ", (from c in pd.QueryColumns select tableName + "." + EscapeSqlIdentifier(c)).ToArray());
+                string cols = string.Join(", ", (from c in pd.QueryColumns select tableName + "." + _dbHandler.EscapeSqlIdentifier(c)).ToArray());
                 if (!rxFrom.IsMatch(sql))
                     sql = string.Format("SELECT {0} FROM {1} {2}", cols, tableName, sql);
                 else
@@ -593,7 +744,6 @@ namespace PetaPoco
         }
 
         public bool EnableAutoSelect { get; set; }
-        public bool EnableNamedParams { get; set; }
         public bool ForceDateTimesToUtc { get; set; }
 
         // Return a typed list of pocos
@@ -749,10 +899,10 @@ namespace PetaPoco
             OpenSharedConnection();
             try
             {
-                using (var cmd = CreateCommand(_sharedConnection, sql, args))
+                using (var cmd = _dbHandler.CreateCommand(_sharedConnection, sql, _transaction, args))
                 {
                     IDataReader r;
-                    var pd = PocoData.ForType(typeof(T));
+                    var pd = PocoData.ForType(typeof(T), _dbHandler);
                     try
                     {
                         r = cmd.ExecuteReader();
@@ -912,11 +1062,11 @@ namespace PetaPoco
         {
             // Last?
             if (typeNext == null)
-                return PocoData.ForType(typeThis).GetFactory(sql, _sharedConnection.ConnectionString, ForceDateTimesToUtc, pos, r.FieldCount - pos, r);
+                return PocoData.ForType(typeThis, _dbHandler).GetFactory(sql, _sharedConnection.ConnectionString, ForceDateTimesToUtc, pos, r.FieldCount - pos, r);
 
             // Get PocoData for the two types
-            PocoData pdThis = PocoData.ForType(typeThis);
-            PocoData pdNext = PocoData.ForType(typeNext);
+            PocoData pdThis = PocoData.ForType(typeThis, _dbHandler);
+            PocoData pdNext = PocoData.ForType(typeNext, _dbHandler);
 
             // Find split point
             int firstColumn = pos;
@@ -1042,7 +1192,7 @@ namespace PetaPoco
             OpenSharedConnection();
             try
             {
-                using (var cmd = CreateCommand(_sharedConnection, sql, args))
+                using (var cmd = _dbHandler.CreateCommand(_sharedConnection, sql, _transaction, args))
                 {
                     IDataReader r;
                     try
@@ -1173,7 +1323,7 @@ namespace PetaPoco
         private WhereClause CreatePrimaryKeyWhereClause(Type pocoType, object valueObject, int startIndex, string paramPrefix)
         {
             var result = new WhereClause();
-            var pd = PocoData.ForType(pocoType);
+            var pd = PocoData.ForType(pocoType, _dbHandler);
             var primaryKeys = pd.TableInfo.PrimaryKey.Split(new[] { "," }, StringSplitOptions.RemoveEmptyEntries);
             var valueObjectType = valueObject.GetType();
             var getPropValue = valueObjectType.Equals(pocoType)
@@ -1193,7 +1343,7 @@ namespace PetaPoco
             {
                 result.Sql.AppendFormat(" {0} {1} = {2}{3}",
                                         result.Sql.Length == 0 ? "WHERE" : "AND",
-                                        EscapeSqlIdentifier(key),
+                                        _dbHandler.EscapeSqlIdentifier(key),
                                         paramPrefix,
                                         startIndex++);
                 result.AddArg(getPropValue(key));
@@ -1205,22 +1355,7 @@ namespace PetaPoco
         public string EscapeTableName(string str)
         {
             // Assume table names with "dot", or opening sq is already escaped
-            return str.IndexOf('.') >= 0 ? str : EscapeSqlIdentifier(str);
-        }
-        public string EscapeSqlIdentifier(string str)
-        {
-            switch (_dbType)
-            {
-                case DBType.MySql:
-                    return string.Format("`{0}`", str);
-
-                case DBType.PostgreSQL:
-                case DBType.Oracle:
-                    return string.Format("\"{0}\"", str);
-
-                default:
-                    return string.Format("[{0}]", str);
-            }
+            return str.IndexOf('.') >= 0 ? str : _dbHandler.EscapeSqlIdentifier(str);
         }
 
         public object Insert(string tableName, string primaryKeyName, object poco)
@@ -1238,9 +1373,9 @@ namespace PetaPoco
                 OpenSharedConnection();
                 try
                 {
-                    using (var cmd = CreateCommand(_sharedConnection, ""))
+                    using (var cmd = _dbHandler.CreateCommand(_sharedConnection, "", _transaction))
                     {
-                        var pd = PocoData.ForObject(poco, primaryKeyName);
+                        var pd = PocoData.ForObject(poco, primaryKeyName, _dbHandler);
                         var names = new List<string>();
                         var values = new List<string>();
                         var index = 0;
@@ -1261,9 +1396,9 @@ namespace PetaPoco
                                 continue;
                             }
 
-                            names.Add(EscapeSqlIdentifier(i.Key));
-                            values.Add(string.Format("{0}{1}", _paramPrefix, index++));
-                            AddParam(cmd, i.Value.GetValue(poco), _paramPrefix);
+                            names.Add(_dbHandler.EscapeSqlIdentifier(i.Key));
+                            values.Add(string.Format("{0}{1}", _dbHandler.ParamPrefix, index++));
+                            _dbHandler.AddParam(cmd, i.Value.GetValue(poco), _dbHandler.ParamPrefix);
                         }
 
                         cmd.CommandText = string.Format("INSERT INTO {0} ({1}) VALUES ({2})",
@@ -1280,82 +1415,7 @@ namespace PetaPoco
                             return true;
                         }
 
-
-                        object id;
-                        switch (_dbType)
-                        {
-                            case DBType.SqlServerCE:
-                                DoPreExecute(cmd);
-                                cmd.ExecuteNonQuery();
-                                OnExecutedCommand(cmd);
-                                id = ExecuteScalar<object>("SELECT @@@IDENTITY AS NewID;");
-                                break;
-                            case DBType.SqlServer:
-                                cmd.CommandText += ";\nSELECT SCOPE_IDENTITY() AS NewID;";
-                                DoPreExecute(cmd);
-                                id = cmd.ExecuteScalar();
-                                OnExecutedCommand(cmd);
-                                break;
-                            case DBType.PostgreSQL:
-                                if (primaryKeyName != null)
-                                {
-                                    cmd.CommandText += string.Format("returning {0} as NewID", EscapeSqlIdentifier(primaryKeyName));
-                                    DoPreExecute(cmd);
-                                    id = cmd.ExecuteScalar();
-                                }
-                                else
-                                {
-                                    id = -1;
-                                    DoPreExecute(cmd);
-                                    cmd.ExecuteNonQuery();
-                                }
-                                OnExecutedCommand(cmd);
-                                break;
-                            case DBType.Oracle:
-                                if (primaryKeyName != null)
-                                {
-                                    cmd.CommandText += string.Format(" returning {0} into :newid", EscapeSqlIdentifier(primaryKeyName));
-                                    var param = cmd.CreateParameter();
-                                    param.ParameterName = ":newid";
-                                    param.Value = DBNull.Value;
-                                    param.Direction = ParameterDirection.ReturnValue;
-                                    param.DbType = DbType.Int64;
-                                    cmd.Parameters.Add(param);
-                                    DoPreExecute(cmd);
-                                    cmd.ExecuteNonQuery();
-                                    id = param.Value;
-                                }
-                                else
-                                {
-                                    id = -1;
-                                    DoPreExecute(cmd);
-                                    cmd.ExecuteNonQuery();
-                                }
-                                OnExecutedCommand(cmd);
-                                break;
-                            case DBType.SQLite:
-                                if (primaryKeyName != null)
-                                {
-                                    cmd.CommandText += ";\nSELECT last_insert_rowid();";
-                                    DoPreExecute(cmd);
-                                    id = cmd.ExecuteScalar();
-                                }
-                                else
-                                {
-                                    id = -1;
-                                    DoPreExecute(cmd);
-                                    cmd.ExecuteNonQuery();
-                                }
-                                OnExecutedCommand(cmd);
-                                break;
-                            default:
-                                cmd.CommandText += ";\nSELECT @@IDENTITY AS NewID;";
-                                DoPreExecute(cmd);
-                                id = cmd.ExecuteScalar();
-                                OnExecutedCommand(cmd);
-                                break;
-                        }
-
+                        object id = _dbHandler.InsertAutoincrement(cmd, primaryKeyName, _transaction);
 
                         // Assign the ID back to the primary key property
                         if (primaryKeyName != null)
@@ -1385,7 +1445,7 @@ namespace PetaPoco
         // Insert an annotated poco object
         public object Insert(object poco)
         {
-            var pd = PocoData.ForType(poco.GetType());
+            var pd = PocoData.ForType(poco.GetType(), _dbHandler);
             return Insert(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, pd.TableInfo.AutoIncrement, poco);
         }
 
@@ -1403,11 +1463,11 @@ namespace PetaPoco
                 OpenSharedConnection();
                 try
                 {
-                    using (var cmd = CreateCommand(_sharedConnection, ""))
+                    using (var cmd = _dbHandler.CreateCommand(_sharedConnection, "", _transaction))
                     {
                         var sb = new StringBuilder();
                         var index = 0;
-                        var pd = PocoData.ForObject(poco, primaryKeyName);
+                        var pd = PocoData.ForObject(poco, primaryKeyName, _dbHandler);
                         if (columns == null)
                         {
                             foreach (var i in pd.Columns)
@@ -1425,10 +1485,10 @@ namespace PetaPoco
                                 // Build the sql
                                 if (index > 0)
                                     sb.Append(", ");
-                                sb.AppendFormat("{0} = {1}{2}", EscapeSqlIdentifier(i.Key), _paramPrefix, index++);
+                                sb.AppendFormat("{0} = {1}{2}", _dbHandler.EscapeSqlIdentifier(i.Key), _dbHandler.ParamPrefix, index++);
 
                                 // Store the parameter in the command
-                                AddParam(cmd, i.Value.GetValue(poco), _paramPrefix);
+                                _dbHandler.AddParam(cmd, i.Value.GetValue(poco), _dbHandler.ParamPrefix);
                             }
                         }
                         else
@@ -1440,10 +1500,10 @@ namespace PetaPoco
                                 // Build the sql
                                 if (index > 0)
                                     sb.Append(", ");
-                                sb.AppendFormat("{0} = {1}{2}", EscapeSqlIdentifier(colname), _paramPrefix, index++);
+                                sb.AppendFormat("{0} = {1}{2}", _dbHandler.EscapeSqlIdentifier(colname), _dbHandler.ParamPrefix, index++);
 
                                 // Store the parameter in the command
-                                AddParam(cmd, pc.GetValue(poco), _paramPrefix);
+                                _dbHandler.AddParam(cmd, pc.GetValue(poco), _dbHandler.ParamPrefix);
                             }
 
                         }
@@ -1475,11 +1535,11 @@ namespace PetaPoco
 
         private void AddPrimaryKeyClauseAndParam(object poco, int index, IDbCommand cmd)
         {
-            var whereClause = CreatePrimaryKeyWhereClause(poco.GetType(), poco, index, _paramPrefix);
+            var whereClause = CreatePrimaryKeyWhereClause(poco.GetType(), poco, index, _dbHandler.ParamPrefix);
             cmd.CommandText += whereClause.Sql.ToString();
             foreach (var argValue in whereClause.Args)
             {
-                AddParam(cmd, argValue, _paramPrefix);
+                _dbHandler.AddParam(cmd, argValue, _dbHandler.ParamPrefix);
             }
         }
 
@@ -1509,19 +1569,19 @@ namespace PetaPoco
         }
         public int Update(object poco, object primaryKeyValue, IEnumerable<string> columns)
         {
-            var pd = PocoData.ForType(poco.GetType());
+            var pd = PocoData.ForType(poco.GetType(), _dbHandler);
             return Update(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco, primaryKeyValue, columns);
         }
 
         public int Update<T>(string sql, params object[] args)
         {
-            var pd = PocoData.ForType(typeof(T));
+            var pd = PocoData.ForType(typeof(T), _dbHandler);
             return Execute(string.Format("UPDATE {0} {1}", EscapeTableName(pd.TableInfo.TableName), sql), args);
         }
 
         public int Update<T>(Sql sql)
         {
-            var pd = PocoData.ForType(typeof(T));
+            var pd = PocoData.ForType(typeof(T), _dbHandler);
             return Execute(new Sql(string.Format("UPDATE {0}", EscapeTableName(pd.TableInfo.TableName))).Append(sql));
         }
 
@@ -1534,7 +1594,7 @@ namespace PetaPoco
 
         public int Delete(object poco)
         {
-            var pd = PocoData.ForType(poco.GetType());
+            var pd = PocoData.ForType(poco.GetType(), _dbHandler);
             return Delete(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco);
         }
 
@@ -1546,20 +1606,20 @@ namespace PetaPoco
 
         public int Delete<T>(string sql, params object[] args)
         {
-            var pd = PocoData.ForType(typeof(T));
+            var pd = PocoData.ForType(typeof(T), _dbHandler);
             return Execute(string.Format("DELETE FROM {0} {1}", EscapeTableName(pd.TableInfo.TableName), sql), args);
         }
 
         public int Delete<T>(Sql sql)
         {
-            var pd = PocoData.ForType(typeof(T));
+            var pd = PocoData.ForType(typeof(T), _dbHandler);
             return Execute(new Sql(string.Format("DELETE FROM {0}", EscapeTableName(pd.TableInfo.TableName))).Append(sql));
         }
 
         // Check if a poco represents a new record
         public bool IsNew(string primaryKeyName, object poco)
         {
-            var pd = PocoData.ForObject(poco, primaryKeyName);
+            var pd = PocoData.ForObject(poco, primaryKeyName, _dbHandler);
             object pk;
             PocoColumn pc;
             if (pd.Columns.TryGetValue(primaryKeyName, out pc))
@@ -1608,7 +1668,7 @@ namespace PetaPoco
 
         public bool IsNew(object poco)
         {
-            var pd = PocoData.ForType(poco.GetType());
+            var pd = PocoData.ForType(poco.GetType(), _dbHandler);
             if (!pd.TableInfo.AutoIncrement)
                 throw new InvalidOperationException("IsNew() and Save() are only supported on tables with auto-increment/identity primary key columns");
             return IsNew(pd.TableInfo.PrimaryKey, poco);
@@ -1629,7 +1689,7 @@ namespace PetaPoco
 
         public void Save(object poco)
         {
-            var pd = PocoData.ForType(poco.GetType());
+            var pd = PocoData.ForType(poco.GetType(), _dbHandler);
             Save(pd.TableInfo.TableName, pd.TableInfo.PrimaryKey, poco);
         }
 
@@ -1680,7 +1740,7 @@ namespace PetaPoco
                 sb.Append("\n");
                 for (int i = 0; i < args.Length; i++)
                 {
-                    sb.AppendFormat("\t -> {0}{1} [{2}] = \"{3}\"\n", _paramPrefix, i, args[i].GetType().Name, args[i]);
+                    sb.AppendFormat("\t -> {0}{1} [{2}] = \"{3}\"\n", _dbHandler.ParamPrefix, i, args[i].GetType().Name, args[i]);
                 }
                 sb.Remove(sb.Length - 1, 1);
             }
@@ -1716,7 +1776,9 @@ namespace PetaPoco
         }
         public class PocoData
         {
-            public static PocoData ForObject(object o, string primaryKeyName)
+            private readonly ISpecificDatabaseHandler _dbHandler;
+
+            public static PocoData ForObject(object o, string primaryKeyName, ISpecificDatabaseHandler dbHandler)
             {
                 var t = o.GetType();
 #if !PETAPOCO_NO_DYNAMIC
@@ -1737,10 +1799,10 @@ namespace PetaPoco
 				}
 				else
 #endif
-                return ForType(t);
+                return ForType(t, dbHandler);
             }
             static System.Threading.ReaderWriterLockSlim RWLock = new System.Threading.ReaderWriterLockSlim();
-            public static PocoData ForType(Type t)
+            public static PocoData ForType(Type t, ISpecificDatabaseHandler dbHandler)
             {
 #if !PETAPOCO_NO_DYNAMIC
 				if (t == typeof(System.Dynamic.ExpandoObject))
@@ -1769,7 +1831,7 @@ namespace PetaPoco
                         return pd;
 
                     // Create it
-                    pd = new PocoData(t);
+                    pd = new PocoData(t, dbHandler);
 
                     m_PocoDatas.Add(t, pd);
                 }
@@ -1781,13 +1843,15 @@ namespace PetaPoco
                 return pd;
             }
 
-            public PocoData()
+            public PocoData(ISpecificDatabaseHandler dbHandler)
             {
+                _dbHandler = dbHandler;
             }
 
-            public PocoData(Type t)
+            public PocoData(Type t, ISpecificDatabaseHandler dbHandler)
             {
                 type = t;
+                _dbHandler = dbHandler;
                 TableInfo = new TableInfo();
 
                 // Get the table name
@@ -2011,7 +2075,9 @@ namespace PetaPoco
                             bool Handled = false;
                             if (converter == null)
                             {
-                                var valuegetter = typeof(IDataRecord).GetMethod("Get" + srcType.Name, new Type[] { typeof(int) });
+                                
+                                //var valuegetter = typeof(IDataRecord).GetMethod("Get" + srcType.Name, new Type[] { typeof(int) });
+                                var valuegetter = _dbHandler.GetGetMethod(srcType);
                                 if (valuegetter != null
                                         && valuegetter.ReturnType == srcType
                                         && (valuegetter.ReturnType == dstType || valuegetter.ReturnType == Nullable.GetUnderlyingType(dstType)))
@@ -2175,7 +2241,6 @@ namespace PetaPoco
         bool _transactionCancelled;
         string _lastSql;
         object[] _lastArgs;
-        string _paramPrefix = "@";
     }
 
     // Transaction object helps maintain transaction depth counts
